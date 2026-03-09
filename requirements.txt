@@ -1,0 +1,18 @@
+# V3 Value Engine - Dependencies
+# Install: pip install -r requirements.txt
+
+# Core data & numerics
+pandas>=2.0
+numpy>=1.24
+
+# Market data
+yfinance>=0.2.31
+
+# Visualization
+matplotlib>=3.7
+
+# Scientific computing (for RSI, statistics)
+scipy>=1.10
+
+# Timezone support (stdlib in Python 3.9+, but explicit for clarity)
+# zoneinfo is built-in; backports-zoneinfo only needed for Python 3.8
