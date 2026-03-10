@@ -177,6 +177,101 @@ class MarketAnalyzer:
 
         return max(-5, min(5, score))
 
+    def _fetch_portfolio_snapshot(self) -> Dict[str, Any]:
+        """Fetch live prices for portfolio holdings and compute P&L.
+
+        Returns:
+            Dict with portfolio_value, daily_change_pct, cost_basis_total,
+            total_unrealized_pnl, unrealized_pnl_pct, positions list, 
+            top_gainers, top_losers.
+        """
+        holdings = config.INITIAL_HOLDINGS
+        cost_basis = getattr(config, 'AVG_COST_BASIS', {})
+        tickers = list(holdings.keys())
+        
+        if not tickers:
+            return {}
+        
+        try:
+            raw = yf.download(tickers, period='2d', interval='1d', progress=False)
+        except Exception as e:
+            print(f"Warning: Could not fetch portfolio data: {e}")
+            return {}
+        
+        positions = []
+        total_value = 0.0
+        total_cost = 0.0
+        total_daily_change = 0.0
+        
+        for ticker in tickers:
+            shares = holdings[ticker]
+            avg_cost = cost_basis.get(ticker, 0)
+            
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    df = raw.xs(ticker, level=1, axis=1)
+                else:
+                    df = raw  # single ticker
+                
+                if df.empty or len(df) < 1:
+                    continue
+                
+                current_price = float(df['Close'].iloc[-1])
+                if len(df) >= 2:
+                    prev_close = float(df['Close'].iloc[-2])
+                    daily_pct = ((current_price - prev_close) / prev_close * 100) if prev_close else 0
+                else:
+                    daily_pct = 0.0
+                
+                position_value = shares * current_price
+                position_cost = shares * avg_cost if avg_cost else 0
+                unrealized = position_value - position_cost if avg_cost else 0
+                unrealized_pct = ((current_price - avg_cost) / avg_cost * 100) if avg_cost else 0
+                daily_dollar = shares * (current_price - prev_close) if len(df) >= 2 else 0
+                
+                positions.append({
+                    'ticker': ticker,
+                    'shares': shares,
+                    'price': round(current_price, 2),
+                    'avg_cost': avg_cost,
+                    'value': round(position_value, 2),
+                    'daily_pct': round(daily_pct, 2),
+                    'daily_dollar': round(daily_dollar, 2),
+                    'unrealized': round(unrealized, 2),
+                    'unrealized_pct': round(unrealized_pct, 2),
+                })
+                
+                total_value += position_value
+                total_cost += position_cost
+                total_daily_change += daily_dollar
+            except Exception:
+                continue
+        
+        if not positions:
+            return {}
+        
+        # Sort for top movers
+        by_daily = sorted(positions, key=lambda p: p['daily_pct'], reverse=True)
+        by_unrealized = sorted(positions, key=lambda p: p['unrealized'], reverse=True)
+        
+        total_unrealized = total_value - total_cost
+        daily_pct = (total_daily_change / (total_value - total_daily_change) * 100) if (total_value - total_daily_change) else 0
+        
+        return {
+            'portfolio_value': round(total_value, 2),
+            'cost_basis_total': round(total_cost, 2),
+            'daily_change_dollar': round(total_daily_change, 2),
+            'daily_change_pct': round(daily_pct, 2),
+            'total_unrealized': round(total_unrealized, 2),
+            'total_unrealized_pct': round((total_unrealized / total_cost * 100) if total_cost else 0, 2),
+            'positions': positions,
+            'top_gainers': [p for p in by_daily[:3] if p['daily_pct'] > 0],
+            'top_losers': [p for p in by_daily[-3:] if p['daily_pct'] < 0],
+            'biggest_winners': by_unrealized[:3],
+            'biggest_losers': by_unrealized[-3:],
+            'num_positions': len(positions),
+        }
+
     # ------------------------------------------------------------------
     # Pre-market scan
     # ------------------------------------------------------------------
@@ -253,6 +348,9 @@ class MarketAnalyzer:
             result['recommended_action'] = 'HOLD'
             result['action_detail'] = 'Unable to determine regime. Stay cautious.'
 
+
+        # --- Portfolio snapshot ---
+        result['portfolio'] = self._fetch_portfolio_snapshot()
         return result
 
     # ------------------------------------------------------------------
@@ -346,6 +444,9 @@ class MarketAnalyzer:
             result['breadth_up_pct'] = 50.0
             result['breadth_sample_size'] = 0
 
+
+        # --- Portfolio snapshot ---
+        result['portfolio'] = self._fetch_portfolio_snapshot()
         return result
 
     # ------------------------------------------------------------------
@@ -413,9 +514,9 @@ class MarketAnalyzer:
         if 'SPY' in index_data:
             spy_df = index_data['SPY']
             if len(spy_df) >= 5:
-                spy_rsi = compute_rsi(spy_df['Close'], period=5)
-                if not spy_rsi.empty:
-                    rsi_val = float(spy_rsi.iloc[-1])
+                rsi_val = compute_rsi(spy_df['Close'], window=5)
+                if rsi_val is not None:
+                    rsi_val = float(rsi_val)
                     result['spy_rsi_5d'] = round(rsi_val, 1)
                     if rsi_val > 70:
                         result['next_day_outlook'] = 'Overbought - potential pullback'
@@ -434,6 +535,9 @@ class MarketAnalyzer:
         else:
             result['next_day_outlook'] = 'SPY data unavailable'
 
+
+        # --- Portfolio snapshot ---
+        result['portfolio'] = self._fetch_portfolio_snapshot()
         return result
 
     # ------------------------------------------------------------------
@@ -490,6 +594,23 @@ class MarketAnalyzer:
             f"Action:  {data.get('recommended_action', 'N/A')}",
             f"Detail:  {data.get('action_detail', '')}",
         ]
+
+        # Portfolio section
+        pf = data.get('portfolio', {})
+        if pf:
+            lines.extend([
+                "",
+                "--- Your Portfolio ---",
+                f"Value:   ${pf.get('portfolio_value', 0):,.0f} ({pf.get('daily_change_pct', 0):+.2f}% today)",
+                f"Day P&L: ${pf.get('daily_change_dollar', 0):+,.0f}",
+                f"Total P&L: ${pf.get('total_unrealized', 0):+,.0f} ({pf.get('total_unrealized_pct', 0):+.1f}%)",
+            ])
+            gainers = pf.get('top_gainers', [])
+            losers = pf.get('top_losers', [])
+            if gainers:
+                lines.append("Movers+: " + ", ".join(f"{p['ticker']} {p['daily_pct']:+.1f}%" for p in gainers))
+            if losers:
+                lines.append("Movers-: " + ", ".join(f"{p['ticker']} {p['daily_pct']:+.1f}%" for p in losers))
         return "\n".join(lines)
 
     def _format_intraday(self, data: Dict[str, Any]) -> str:
@@ -521,6 +642,23 @@ class MarketAnalyzer:
         for s in data.get('sector_laggards', []):
             lines.append(f"  {s['sector']:<25} {s['change_pct']:+.2f}%")
 
+
+        # Portfolio section
+        pf = data.get('portfolio', {})
+        if pf:
+            lines.extend([
+                "",
+                "--- Your Portfolio ---",
+                f"Value:   ${pf.get('portfolio_value', 0):,.0f} ({pf.get('daily_change_pct', 0):+.2f}% today)",
+                f"Day P&L: ${pf.get('daily_change_dollar', 0):+,.0f}",
+                f"Total P&L: ${pf.get('total_unrealized', 0):+,.0f} ({pf.get('total_unrealized_pct', 0):+.1f}%)",
+            ])
+            gainers = pf.get('top_gainers', [])
+            losers = pf.get('top_losers', [])
+            if gainers:
+                lines.append("Movers+: " + ", ".join(f"{p['ticker']} {p['daily_pct']:+.1f}%" for p in gainers))
+            if losers:
+                lines.append("Movers-: " + ", ".join(f"{p['ticker']} {p['daily_pct']:+.1f}%" for p in losers))
         return "\n".join(lines)
 
     def _format_eod(self, data: Dict[str, Any]) -> str:
@@ -563,6 +701,30 @@ class MarketAnalyzer:
             f"Outlook:   {data.get('next_day_outlook', 'N/A')}",
         ])
 
+
+        # Portfolio section
+        pf = data.get('portfolio', {})
+        if pf:
+            lines.extend([
+                "",
+                "--- Your Portfolio ---",
+                f"Value:     ${pf.get('portfolio_value', 0):,.0f} ({pf.get('daily_change_pct', 0):+.2f}% today)",
+                f"Day P&L:   ${pf.get('daily_change_dollar', 0):+,.0f}",
+                f"Total P&L: ${pf.get('total_unrealized', 0):+,.0f} ({pf.get('total_unrealized_pct', 0):+.1f}%)",
+                f"Positions: {pf.get('num_positions', 0)}",
+            ])
+            gainers = pf.get('top_gainers', [])
+            losers = pf.get('top_losers', [])
+            if gainers:
+                lines.append("Movers+: " + ", ".join(f"{p['ticker']} {p['daily_pct']:+.1f}%" for p in gainers))
+            if losers:
+                lines.append("Movers-: " + ", ".join(f"{p['ticker']} {p['daily_pct']:+.1f}%" for p in losers))
+            winners = pf.get('biggest_winners', [])[:3]
+            losers_total = pf.get('biggest_losers', [])[:3]
+            if winners:
+                lines.append("Best Total: " + ", ".join(f"{p['ticker']} ${p['unrealized']:+,.0f}" for p in winners))
+            if losers_total:
+                lines.append("Worst Total: " + ", ".join(f"{p['ticker']} ${p['unrealized']:+,.0f}" for p in losers_total))
         return "\n".join(lines)
 
     def __repr__(self) -> str:
